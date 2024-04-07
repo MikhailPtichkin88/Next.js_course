@@ -16,7 +16,7 @@ export type Customer = {
   image_url: string;
 };
 
-export type Invoice = {
+export type TInvoice = {
   id: string;
   customer_id: string;
   amount: number;
@@ -26,7 +26,7 @@ export type Invoice = {
   status: 'pending' | 'paid';
 };
 
-export type Revenue = {
+export type TRevenue = {
   month: string;
   revenue: number;
 };
@@ -44,7 +44,7 @@ export type LatestInvoiceRaw = Omit<LatestInvoice, 'amount'> & {
   amount: number;
 };
 
-export type InvoicesTable = {
+export type TInvoicesTable = {
   id: string;
   customer_id: string;
   name: string;

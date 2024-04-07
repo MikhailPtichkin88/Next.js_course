@@ -1,19 +1,29 @@
+import { Revenue } from '@/server/models';
 import { sql } from '@vercel/postgres';
+import { unstable_noStore as noStore } from 'next/cache';
+import { Op, literal } from 'sequelize';
+import { Customer, Invoice } from '../../server/models';
 import {
   CustomerField,
   CustomersTableType,
   InvoiceForm,
-  InvoicesTable,
-  LatestInvoiceRaw,
+  LatestInvoice,
+  TInvoicesTable,
+  TRevenue,
   User,
-  Revenue,
 } from './definitions';
 import { formatCurrency } from './utils';
+interface IFetchCardData {
+  numberOfCustomers: number;
+  numberOfInvoices: number;
+  totalPaidInvoices: string;
+  totalPendingInvoices: string;
+}
 
 export async function fetchRevenue() {
   // Add noStore() here to prevent the response from being cached.
   // This is equivalent to in fetch(..., {cache: 'no-store'}).
-
+  noStore();
   try {
     // Artificially delay a response for demo purposes.
     // Don't do this in production :)
@@ -21,11 +31,11 @@ export async function fetchRevenue() {
     // console.log('Fetching revenue data...');
     // await new Promise((resolve) => setTimeout(resolve, 3000));
 
-    const data = await sql<Revenue>`SELECT * FROM revenue`;
+    const data = await Revenue.findAll();
 
     // console.log('Data fetch completed after 3 seconds.');
 
-    return data.rows;
+    return data as unknown as TRevenue[];
   } catch (error) {
     console.error('Database Error:', error);
     throw new Error('Failed to fetch revenue data.');
@@ -33,47 +43,71 @@ export async function fetchRevenue() {
 }
 
 export async function fetchLatestInvoices() {
-  try {
-    const data = await sql<LatestInvoiceRaw>`
-      SELECT invoices.amount, customers.name, customers.image_url, customers.email, invoices.id
-      FROM invoices
-      JOIN customers ON invoices.customer_id = customers.id
-      ORDER BY invoices.date DESC
-      LIMIT 5`;
+  noStore();
 
-    const latestInvoices = data.rows.map((invoice) => ({
-      ...invoice,
-      amount: formatCurrency(invoice.amount),
-    }));
-    return latestInvoices;
+  try {
+    const latestInvoices = await Invoice.findAll({
+      attributes: ['amount', 'id'],
+      include: {
+        model: Customer,
+        attributes: ['name', 'image_url', 'email'],
+      },
+      order: [['date', 'DESC']],
+      limit: 5,
+      raw: true,
+      nest: true,
+    });
+
+    const formattedInvoices: LatestInvoice[] = latestInvoices.map(
+      (invoice: any) => {
+        return {
+          amount: formatCurrency(invoice.amount),
+          id: invoice.id,
+          name: invoice?.customer?.name,
+          image_url: invoice?.customer?.image_url,
+          email: invoice?.customer?.email,
+        };
+      },
+    );
+    return new Promise((res) =>
+      setTimeout(() => res(formattedInvoices), 3000),
+    ) as Promise<LatestInvoice[]>;
   } catch (error) {
     console.error('Database Error:', error);
     throw new Error('Failed to fetch the latest invoices.');
   }
 }
 
-export async function fetchCardData() {
+export async function fetchCardData(): Promise<IFetchCardData> {
+  noStore();
+
   try {
-    // You can probably combine these into a single SQL query
-    // However, we are intentionally splitting them to demonstrate
-    // how to initialize multiple queries in parallel with JS.
-    const invoiceCountPromise = sql`SELECT COUNT(*) FROM invoices`;
-    const customerCountPromise = sql`SELECT COUNT(*) FROM customers`;
-    const invoiceStatusPromise = sql`SELECT
-         SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) AS "paid",
-         SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END) AS "pending"
-         FROM invoices`;
+    const invoiceCountPaid = Invoice.sum('amount', {
+      where: {
+        status: 'paid',
+      },
+    });
+
+    const invoiceCountPending = Invoice.sum('amount', {
+      where: {
+        status: 'pending',
+      },
+    });
+
+    const invoiceCountAll = Invoice.count();
+    const customerCountAll = Customer.count();
 
     const data = await Promise.all([
-      invoiceCountPromise,
-      customerCountPromise,
-      invoiceStatusPromise,
+      invoiceCountAll,
+      customerCountAll,
+      invoiceCountPending,
+      invoiceCountPaid,
     ]);
 
-    const numberOfInvoices = Number(data[0].rows[0].count ?? '0');
-    const numberOfCustomers = Number(data[1].rows[0].count ?? '0');
-    const totalPaidInvoices = formatCurrency(data[2].rows[0].paid ?? '0');
-    const totalPendingInvoices = formatCurrency(data[2].rows[0].pending ?? '0');
+    const numberOfInvoices = Number(data[0] ?? '0');
+    const numberOfCustomers = Number(data[1] ?? '0');
+    const totalPaidInvoices = formatCurrency(data[2] ?? '0');
+    const totalPendingInvoices = formatCurrency(data[3] ?? '0');
 
     return {
       numberOfCustomers,
@@ -88,6 +122,7 @@ export async function fetchCardData() {
 }
 
 const ITEMS_PER_PAGE = 6;
+
 export async function fetchFilteredInvoices(
   query: string,
   currentPage: number,
@@ -95,28 +130,31 @@ export async function fetchFilteredInvoices(
   const offset = (currentPage - 1) * ITEMS_PER_PAGE;
 
   try {
-    const invoices = await sql<InvoicesTable>`
-      SELECT
-        invoices.id,
-        invoices.amount,
-        invoices.date,
-        invoices.status,
-        customers.name,
-        customers.email,
-        customers.image_url
-      FROM invoices
-      JOIN customers ON invoices.customer_id = customers.id
-      WHERE
-        customers.name ILIKE ${`%${query}%`} OR
-        customers.email ILIKE ${`%${query}%`} OR
-        invoices.amount::text ILIKE ${`%${query}%`} OR
-        invoices.date::text ILIKE ${`%${query}%`} OR
-        invoices.status ILIKE ${`%${query}%`}
-      ORDER BY invoices.date DESC
-      LIMIT ${ITEMS_PER_PAGE} OFFSET ${offset}
-    `;
+    const invoices = await Invoice.findAll({
+      attributes: ['id', 'amount', 'date', 'status'],
+      include: [
+        {
+          model: Customer,
+          attributes: ['name', 'email', 'image_url'],
+          where: {
+            [Op.or]: [
+              { name: { [Op.iLike]: `%${query}%` } },
+              { email: { [Op.iLike]: `%${query}%` } },
+            ],
+          },
+        },
+      ],
+      order: [['date', 'DESC']],
+      limit: ITEMS_PER_PAGE,
+      offset: offset,
+      raw: true,
+      nest: true,
+    });
 
-    return invoices.rows;
+    return invoices.map((invoice: any) => ({
+      ...invoice,
+      ...invoice.customer,
+    }));
   } catch (error) {
     console.error('Database Error:', error);
     throw new Error('Failed to fetch invoices.');
@@ -125,18 +163,29 @@ export async function fetchFilteredInvoices(
 
 export async function fetchInvoicesPages(query: string) {
   try {
-    const count = await sql`SELECT COUNT(*)
-    FROM invoices
-    JOIN customers ON invoices.customer_id = customers.id
-    WHERE
-      customers.name ILIKE ${`%${query}%`} OR
-      customers.email ILIKE ${`%${query}%`} OR
-      invoices.amount::text ILIKE ${`%${query}%`} OR
-      invoices.date::text ILIKE ${`%${query}%`} OR
-      invoices.status ILIKE ${`%${query}%`}
-  `;
+    const invoices = await Invoice.count({
+      // where: {
+      //   [Op.or]: [
+      //     { amount: { [Op.iLike]: `%${query}%` } },
+      //     { date: { [Op.iLike]: `%${query}%` } },
+      //     { status: { [Op.iLike]: `%${query}%` } },
+      //   ],
+      // },
+      include: [
+        {
+          model: Customer,
+          where: {
+            [Op.or]: [
+              { name: { [Op.iLike]: `%${query}%` } },
+              { email: { [Op.iLike]: `%${query}%` } },
+            ],
+          },
+        },
+      ],
+    });
 
-    const totalPages = Math.ceil(Number(count.rows[0].count) / ITEMS_PER_PAGE);
+    const totalPages = Math.ceil(Number(invoices) / ITEMS_PER_PAGE);
+    console.log(totalPages);
     return totalPages;
   } catch (error) {
     console.error('Database Error:', error);
@@ -145,6 +194,8 @@ export async function fetchInvoicesPages(query: string) {
 }
 
 export async function fetchInvoiceById(id: string) {
+  noStore();
+
   try {
     const data = await sql<InvoiceForm>`
       SELECT
@@ -188,6 +239,8 @@ export async function fetchCustomers() {
 }
 
 export async function fetchFilteredCustomers(query: string) {
+  noStore();
+
   try {
     const data = await sql<CustomersTableType>`
 		SELECT
@@ -221,6 +274,8 @@ export async function fetchFilteredCustomers(query: string) {
 }
 
 export async function getUser(email: string) {
+  noStore();
+
   try {
     const user = await sql`SELECT * FROM users WHERE email=${email}`;
     return user.rows[0] as User;
